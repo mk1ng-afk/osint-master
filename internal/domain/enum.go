@@ -3,8 +3,8 @@ package domain
 
 import (
 	"crypto/tls" // for SSL certificate inspection
-	"encoding/json"
 	"fmt"
+	"io"
 	"net" // for DNS lookups and TCP connections
 	"net/http"
 	"strings"
@@ -26,37 +26,54 @@ type CrtShEntry struct {
 
 // GetSubdomains fetches subdomains using Certificate Transparency Logs via crt.sh
 // crt.sh is a public database of SSL certificates — every cert issued for a domain is logged there
+// GetSubdomains fetches subdomains using HackerTarget API
+// HackerTarget is more reliable than crt.sh for network-restricted environments
 func GetSubdomains(domain string) ([]string, error) {
-	// %25 is URL-encoded % — we search for wildcard *.domain.com
-	url := fmt.Sprintf("https://crt.sh/?q=%%.%s&output=json", domain)
+	url := fmt.Sprintf("https://api.hackertarget.com/hostsearch/?q=%s", domain)
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(url)
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("crt.sh request failed: %w", err)
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("hackertarget request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// parse the JSON array from crt.sh
-	var entries []CrtShEntry
-	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
-		return nil, fmt.Errorf("failed to parse crt.sh response: %w", err)
+	// HackerTarget returns plain text: "subdomain,ip" per line
+	// Example: www.example.com,93.184.216.34
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// use a map to deduplicate subdomains (crt.sh returns many duplicates)
+	// check if API returned an error message
+	bodyStr := string(body)
+	if strings.HasPrefix(bodyStr, "error") || strings.HasPrefix(bodyStr, "API") {
+		return nil, fmt.Errorf("hackertarget API error: %s", bodyStr)
+	}
+
+	// parse each line and extract subdomain name
 	seen := make(map[string]bool)
 	var subdomains []string
 
-	for _, e := range entries {
-		// name_value can contain multiple subdomains separated by newlines
-		for _, name := range strings.Split(e.NameValue, "\n") {
-			name = strings.TrimSpace(name)
-			// skip wildcards (*.example.com) and unrelated domains
-			if strings.Contains(name, domain) && !strings.HasPrefix(name, "*") {
-				if !seen[name] {
-					seen[name] = true
-					subdomains = append(subdomains, name)
-				}
+	for _, line := range strings.Split(bodyStr, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// each line is "subdomain,ip" — take only the subdomain part
+		parts := strings.Split(line, ",")
+		if len(parts) >= 1 {
+			name := parts[0]
+			if strings.Contains(name, domain) && !seen[name] {
+				seen[name] = true
+				subdomains = append(subdomains, name)
 			}
 		}
 	}
