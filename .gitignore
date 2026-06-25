@@ -1,0 +1,4 @@
+osintmaster
+output/
+.env
+*.key
